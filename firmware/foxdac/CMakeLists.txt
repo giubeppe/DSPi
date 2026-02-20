@@ -47,6 +47,12 @@ target_compile_definitions(foxdac PRIVATE
     PICO_AUDIO_SPDIF_PIO=0
     PICO_AUDIO_SPDIF_DMA_IRQ=1
 
+    # I2S first output (PCM5102): PIO1 SM1, DMA4 (SPDIF uses 0-3)
+    PICO_AUDIO_I2S_PIO=1
+    PICO_AUDIO_I2S_DMA_IRQ=1
+    PICO_AUDIO_I2S_DATA_PIN=22
+    PICO_AUDIO_I2S_CLOCK_PIN_BASE=26
+
     PICO_DEFAULT_UART_TX_PIN=12
 
     # pico-extras usb_device configuration
@@ -63,6 +69,7 @@ target_link_libraries(foxdac
     hardware_flash
     hardware_adc
     pico_audio_spdif_multi
+    pico_audio_i2s
     usb_device
 )
 

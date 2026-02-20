@@ -301,12 +301,12 @@ int flash_load_params(void) {
         // Default pins used as reference for validation
 #if PICO_RP2350
         static const uint8_t default_pins[NUM_PIN_OUTPUTS] = {
-            PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2,
+            PICO_AUDIO_I2S_DATA_PIN, PICO_SPDIF_PIN_2,
             PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN
         };
 #else
         static const uint8_t default_pins[NUM_PIN_OUTPUTS] = {
-            PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
+            PICO_AUDIO_I2S_DATA_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
         };
 #endif
         for (int i = 0; i < NUM_PIN_OUTPUTS; i++) {
@@ -379,8 +379,8 @@ void flash_factory_reset(void) {
         matrix_mixer.outputs[out].gain_linear = 1.0f;
     }
 
-    // Reset pin configuration to defaults
-    output_pins[0] = PICO_AUDIO_SPDIF_PIN;
+    // Reset pin configuration to defaults (output 0 = I2S data pin)
+    output_pins[0] = PICO_AUDIO_I2S_DATA_PIN;
     output_pins[1] = PICO_SPDIF_PIN_2;
 #if PICO_RP2350
     output_pins[2] = PICO_SPDIF_PIN_3;

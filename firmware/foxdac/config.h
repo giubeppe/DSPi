@@ -32,9 +32,14 @@ extern volatile uint32_t nominal_feedback_10_14;
 
 #define ENABLE_SUB 1
 
-// S/PDIF Output Pins
+// First output (Out 1-2): I2S to PCM5102
+#define PICO_AUDIO_I2S_DATA_PIN    22   // DIN on PCM5102
+#define PICO_AUDIO_I2S_BCLK_PIN    26   // BCLK
+#define PICO_AUDIO_I2S_LRCLK_PIN   27   // WS / LRCLK (clock_pin_base + 1)
+
+// S/PDIF Output Pins (Out 3-4, 5-6, 7-8)
 #undef PICO_AUDIO_SPDIF_PIN
-#define PICO_AUDIO_SPDIF_PIN   6    // S/PDIF 1 (Out 1-2)
+#define PICO_AUDIO_SPDIF_PIN   6    // legacy; first output is now I2S
 #define PICO_SPDIF_PIN_2       7    // S/PDIF 2 (Out 3-4)
 #if PICO_RP2350
 #define PICO_SPDIF_PIN_3       8    // S/PDIF 3 (Out 5-6) — RP2350 only

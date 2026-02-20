@@ -14,6 +14,7 @@
 #include "pico/usb_device_private.h"
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
+#include "pico/audio_i2s.h"
 #include "hardware/sync.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
@@ -1388,15 +1389,15 @@ static void vendor_send_response(const void *data, uint len) {
     usb_start_single_buffer_control_in_transfer();
 }
 
-// Runtime pin configuration
+// Runtime pin configuration (output 0 = I2S fixed pins; 1.. = SPDIF/PDM)
 #if PICO_RP2350
 uint8_t output_pins[NUM_PIN_OUTPUTS] = {
-    PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2,
+    PICO_AUDIO_I2S_DATA_PIN, PICO_SPDIF_PIN_2,
     PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN
 };
 #else
 uint8_t output_pins[NUM_PIN_OUTPUTS] = {
-    PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
+    PICO_AUDIO_I2S_DATA_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
 };
 #endif
 
@@ -1725,6 +1726,9 @@ static bool vendor_setup_request_handler(__unused struct usb_interface *interfac
                 } else if (new_pin == output_pins[out_idx]) {
                     // No-op: pin unchanged
                     status = PIN_CONFIG_SUCCESS;
+                } else if (out_idx == 0) {
+                    // Output 0 is I2S (fixed pins 22/26/27), pin not changeable
+                    status = PIN_CONFIG_SUCCESS;
                 } else if (out_idx < NUM_SPDIF_INSTANCES) {
                     // SPDIF output: disable → change pin → re-enable
                     audio_spdif_instance_t *inst = spdif_instance_ptrs[out_idx];
@@ -1837,21 +1841,23 @@ static const char *_get_descriptor_string(uint index) {
 // INIT
 // ----------------------------------------------------------------------------
 
-// S/PDIF Instances
-static audio_spdif_instance_t spdif_instance_1 = {0};  // Out 1-2
+// First output (Out 1-2): I2S to PCM5102 — uses producer_pool_1
+#define I2S_DMA_CHANNEL  4   // SPDIF uses 0..3
+#define I2S_PIO_SM       1   // PIO1 SM1 (PDM uses PIO1 SM0)
+
+static const audio_i2s_config_t i2s_config = {
+    .data_pin = PICO_AUDIO_I2S_DATA_PIN,
+    .clock_pin_base = PICO_AUDIO_I2S_BCLK_PIN,
+    .dma_channel = I2S_DMA_CHANNEL,
+    .pio_sm = I2S_PIO_SM,
+};
+
+// S/PDIF Instances (Out 3-4, 5-6, 7-8)
 static audio_spdif_instance_t spdif_instance_2 = {0};  // Out 3-4
 #if PICO_RP2350
 static audio_spdif_instance_t spdif_instance_3 = {0};  // Out 5-6
 static audio_spdif_instance_t spdif_instance_4 = {0};  // Out 7-8
 #endif
-
-struct audio_spdif_config spdif_config_1 = {
-    .pin = PICO_AUDIO_SPDIF_PIN,  // GPIO 6
-    .dma_channel = 0,
-    .pio_sm = 0,
-    .pio = PICO_AUDIO_SPDIF_PIO,
-    .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
-};
 
 struct audio_spdif_config spdif_config_2 = {
     .pin = PICO_SPDIF_PIN_2,  // GPIO 7
@@ -1880,12 +1886,6 @@ struct audio_spdif_config spdif_config_4 = {
 #endif
 
 struct audio_buffer_format producer_format = { .format = &audio_format_48k, .sample_stride = 4 };
-
-// Legacy aliases
-#define spdif_instance spdif_instance_1
-#define spdif_sub_instance spdif_instance_2
-#define config spdif_config_1
-#define sub_config spdif_config_2
 
 // Initialize matrix mixer with default stereo pass-through
 static void matrix_init_defaults(void) {
@@ -1917,7 +1917,7 @@ void usb_sound_card_init(void) {
     // Initialize matrix mixer defaults
     matrix_init_defaults();
 
-    // S/PDIF Setup (this must happen before USB init to claim DMA channels)
+    // Producer pools (must happen before USB init to claim DMA channels)
     producer_pool_1 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
     producer_pool_2 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
 #if PICO_RP2350
@@ -1925,10 +1925,12 @@ void usb_sound_card_init(void) {
     producer_pool_4 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
 #endif
 
-    // Setup S/PDIF instances
-    audio_spdif_setup(&spdif_instance_1, &audio_format_48k, &spdif_config_1);
-    audio_spdif_connect_extra(&spdif_instance_1, producer_pool_1, false, AUDIO_BUFFER_COUNT / 2, NULL);
+    // Output 0 (Out 1-2): I2S to PCM5102
+    audio_i2s_setup(&audio_format_48k, &i2s_config);
+    audio_i2s_connect_extra(producer_pool_1, false, AUDIO_BUFFER_COUNT / 2, 192, NULL);
+    audio_i2s_set_enabled(true);
 
+    // Outputs 1..: S/PDIF instances
     audio_spdif_setup(&spdif_instance_2, &audio_format_48k, &spdif_config_2);
     audio_spdif_connect_extra(&spdif_instance_2, producer_pool_2, false, AUDIO_BUFFER_COUNT / 2, NULL);
 
@@ -1940,8 +1942,8 @@ void usb_sound_card_init(void) {
     audio_spdif_connect_extra(&spdif_instance_4, producer_pool_4, false, AUDIO_BUFFER_COUNT / 2, NULL);
 #endif
 
-    // Populate instance pointer array for pin config commands
-    spdif_instance_ptrs[0] = &spdif_instance_1;
+    // Instance pointer array for pin config (output 0 = I2S, no SPDIF instance)
+    spdif_instance_ptrs[0] = NULL;
     spdif_instance_ptrs[1] = &spdif_instance_2;
 #if PICO_RP2350
     spdif_instance_ptrs[2] = &spdif_instance_3;
@@ -1950,17 +1952,17 @@ void usb_sound_card_init(void) {
 
     irq_set_priority(DMA_IRQ_0 + PICO_AUDIO_SPDIF_DMA_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
 
-    // Start all outputs synchronized
+    // Start S/PDIF outputs synchronized (output 0 is I2S, not in sync group)
 #if PICO_RP2350
     audio_spdif_instance_t *spdif_all[] = {
-        &spdif_instance_1, &spdif_instance_2, &spdif_instance_3, &spdif_instance_4
+        &spdif_instance_2, &spdif_instance_3, &spdif_instance_4
     };
-    audio_spdif_enable_sync(spdif_all, 4);
+    audio_spdif_enable_sync(spdif_all, 3);
 #else
     audio_spdif_instance_t *spdif_all[] = {
-        &spdif_instance_1, &spdif_instance_2
+        &spdif_instance_2
     };
-    audio_spdif_enable_sync(spdif_all, 2);
+    audio_spdif_enable_sync(spdif_all, 1);
 #endif
 
     // Initialize pico-extras USB device with 3 interfaces: AC, AS, Vendor

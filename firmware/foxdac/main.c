@@ -43,6 +43,12 @@ void __not_in_flash_func(usb_sof_irq)(void) {
     extern audio_spdif_instance_t *spdif_instance_ptrs[];
     audio_spdif_instance_t *inst = spdif_instance_ptrs[0];
 
+    // Output 0 is I2S (no SPDIF instance): use nominal feedback
+    if (!inst) {
+        feedback_10_14 = nominal_feedback_10_14;
+        return;
+    }
+
     // Read total DMA words consumed by instance 0 (sub-buffer precision)
     uint32_t remaining = dma_channel_hw_addr(inst->dma_channel)->transfer_count;
     uint32_t current_total = inst->words_consumed
@@ -191,10 +197,11 @@ void core0_init() {
         dsp_update_delay_samples(48000.0f);
         restore_interrupts(flags);
 
-        // Apply saved SPDIF pin configuration (before Core 1 starts)
+        // Apply saved output pin configuration (output 0 = I2S fixed, skip)
         extern uint8_t output_pins[];
         extern audio_spdif_instance_t *spdif_instance_ptrs[];
         for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+            if (i == 0 || !spdif_instance_ptrs[i]) continue;
             if (output_pins[i] != spdif_instance_ptrs[i]->pin) {
                 audio_spdif_set_enabled(spdif_instance_ptrs[i], false);
                 audio_spdif_change_pin(spdif_instance_ptrs[i], output_pins[i]);

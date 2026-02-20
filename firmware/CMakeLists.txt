@@ -23,5 +23,7 @@ pico_sdk_init()
 
 # Local multi-instance S/PDIF library (replaces system pico_audio_spdif)
 add_subdirectory(pico-extras/src/rp2_common/pico_audio_spdif_multi)
+# I2S for first output (PCM5102)
+add_subdirectory(pico-extras/src/rp2_common/pico_audio_i2s)
 
 add_subdirectory(foxdac)

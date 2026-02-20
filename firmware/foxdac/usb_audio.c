@@ -1241,6 +1241,9 @@ static void vendor_cmd_packet(struct usb_endpoint *ep) {
             if (buffer->data_len >= 1) {
                 crossfeed_config.enabled = (vendor_rx_buf[0] != 0);
                 crossfeed_update_pending = true;
+                // When disabling, set bypass immediately so next packet skips crossfeed
+                if (!crossfeed_config.enabled)
+                    crossfeed_bypassed = true;
             }
             break;
 

@@ -254,6 +254,12 @@ int main(void) {
     // Enable watchdog
     watchdog_enable(8000, 1);
 
+    // Sync crossfeed state and bypass flag once after init/flash load so they match config
+    // before any audio is processed (avoids crossfeed "not working" if main loop was delayed)
+    crossfeed_update_pending = false;
+    crossfeed_compute_coefficients(&crossfeed_state, (const CrossfeedConfig *)&crossfeed_config, (float)audio_state.freq);
+    crossfeed_bypassed = !crossfeed_config.enabled;
+
     while (1) {
         // Update watchdog
         watchdog_update();

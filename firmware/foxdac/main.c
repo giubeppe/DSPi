@@ -109,10 +109,10 @@ static void perform_rate_change(uint32_t new_freq) {
     audio_format_48k.sample_freq = new_freq;
 
 #if PICO_RP2350
-    // RP2350: Dynamic clock switching for optimal performance and integer PIO dividers
-    // 48kHz family -> 288MHz (48000 * 6000)
-    // 44.1kHz family -> 264.6MHz (44100 * 6000)
-    uint32_t target_freq = (new_freq == 44100) ? 264600000 : 288000000;
+    // RP2350: Dynamic clock switching for integer PIO dividers (I2S/SPDIF, no deterministic jitter)
+    // 48kHz/96kHz -> 307.2MHz (48000*6400) for integer I2S PIO divider
+    // 44.1kHz -> 264.6MHz (44100*6000)
+    uint32_t target_freq = (new_freq == 44100) ? 264600000 : 307200000;
     
     // Only change if needed to avoid glitches
     if (clock_get_hz(clk_sys) != target_freq) {
@@ -122,11 +122,12 @@ static void perform_rate_change(uint32_t new_freq) {
         set_sys_clock_hz(target_freq, false);
     }
 #else
-    // RP2040: Change system clock for optimal S/PDIF timing
-    // Overclocked to 288MHz / 264.6MHz
+    // RP2040: System clock for integer PIO dividers (I2S) and SPDIF
+    // 48kHz/96kHz -> 307.2MHz (integer divider 25600 for I2S at 48k)
+    // 44.1kHz -> 264.6MHz
     if((new_freq == 48000 || new_freq == 96000) && clock_176mhz) {
-        // 288MHz (48000 * 6000) -> VCO 1152 MHz
-        set_sys_clock_pll(1152000000, 4, 1);
+        // 307.2MHz -> VCO 1228.8 MHz
+        set_sys_clock_pll(1228800000, 4, 1);
         clock_176mhz = 0;
     }
     else if(new_freq == 44100 && !clock_176mhz) {
@@ -161,16 +162,15 @@ void core0_init() {
     vreg_set_voltage(VREG_VOLTAGE_1_10);
     busy_wait_ms(10);
 
-    // Target 288MHz for 48kHz audio start
-    if (!set_sys_clock_hz(288000000, false)) {
-        // Fall back to 150MHz if 288MHz not achievable
+    // 307.2MHz for 48kHz I2S (integer PIO divider, no deterministic jitter)
+    if (!set_sys_clock_hz(307200000, false)) {
         set_sys_clock_hz(150000000, false);
     }
 #else
     vreg_set_voltage(VREG_VOLTAGE_1_20);
     busy_wait_ms(10);
-    // Initial 288MHz
-    set_sys_clock_pll(1152000000, 4, 1);
+    // Initial 307.2MHz (48k family: integer I2S PIO divider)
+    set_sys_clock_pll(1228800000, 4, 1);
 #endif
 
     gpio_init(23); gpio_set_dir(23, GPIO_OUT); gpio_put(23, 1);

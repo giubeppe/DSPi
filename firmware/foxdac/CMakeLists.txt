@@ -43,22 +43,22 @@ target_include_directories(foxdac PRIVATE
 target_compile_definitions(foxdac PRIVATE
     AUDIO_FREQ_MAX=48000
 
-    # S/PDIF output configuration (pins defined in config.h)
-    PICO_AUDIO_SPDIF_PIO=0
-    PICO_AUDIO_SPDIF_DMA_IRQ=1
-
-    # I2S first output (PCM5102): PIO1 SM1, DMA4 (SPDIF uses 0-3)
-    PICO_AUDIO_I2S_PIO=1
+    # I2S output configuration (Out 1-2)
+    PICO_AUDIO_I2S_PIO=0
     PICO_AUDIO_I2S_DMA_IRQ=1
     PICO_AUDIO_I2S_DATA_PIN=22
     PICO_AUDIO_I2S_CLOCK_PIN_BASE=26
+
+    # S/PDIF output configuration (remaining pairs)
+    PICO_AUDIO_SPDIF_PIO=0
+    PICO_AUDIO_SPDIF_DMA_IRQ=1
 
     PICO_DEFAULT_UART_TX_PIN=12
 
     # pico-extras usb_device configuration
     PICO_USBDEV_USE_ZERO_BASED_INTERFACES=1
     PICO_USBDEV_MAX_DESCRIPTOR_SIZE=256
-    PICO_USBDEV_ISOCHRONOUS_BUFFER_STRIDE_TYPE=2
+    PICO_USBDEV_ISOCHRONOUS_BUFFER_STRIDE_TYPE=3
 )
 
 target_link_libraries(foxdac
@@ -68,8 +68,8 @@ target_link_libraries(foxdac
     hardware_pwm
     hardware_flash
     hardware_adc
-    pico_audio_spdif_multi
     pico_audio_i2s
+    pico_audio_spdif_multi
     usb_device
 )
 

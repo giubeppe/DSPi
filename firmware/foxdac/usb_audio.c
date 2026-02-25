@@ -13,8 +13,8 @@
 #include "pico/usb_device.h"
 #include "pico/usb_device_private.h"
 #include "pico/audio.h"
-#include "pico/audio_spdif.h"
 #include "pico/audio_i2s.h"
+#include "pico/audio_spdif.h"
 #include "hardware/sync.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
@@ -91,6 +91,7 @@ volatile uint64_t total_samples_produced = 0;
 volatile uint64_t start_time_us = 0;
 volatile bool sync_started = false;
 static volatile uint64_t last_packet_time_us = 0;
+static volatile uint8_t usb_input_bit_depth = 16;
 #define AUDIO_GAP_THRESHOLD_US 50000  // 50ms - reset sync if packets stop this long
 
 // Idle-time CPU load metering (Core 0)
@@ -98,14 +99,14 @@ static uint32_t cpu0_last_packet_end = 0;
 static uint32_t cpu0_load_q8 = 0;         // EMA in Q8 fixed point (0-25600 = 0-100%)
 static bool cpu0_load_primed = false;
 
-// Audio Pools (S/PDIF stereo pairs)
-struct audio_buffer_pool *producer_pool_1 = NULL;  // S/PDIF 1 (Out 1-2)
-struct audio_buffer_pool *producer_pool_2 = NULL;  // S/PDIF 2 (Out 3-4)
+// Audio Pools (stereo pairs: I2S + S/PDIF)
+struct audio_buffer_pool *producer_pool_1 = NULL;  // I2S (Out 1-2)
+struct audio_buffer_pool *producer_pool_2 = NULL;  // S/PDIF 1 (Out 3-4)
 #if PICO_RP2350
-struct audio_buffer_pool *producer_pool_3 = NULL;  // S/PDIF 3 (Out 5-6)
-struct audio_buffer_pool *producer_pool_4 = NULL;  // S/PDIF 4 (Out 7-8)
+struct audio_buffer_pool *producer_pool_3 = NULL;  // S/PDIF 2 (Out 5-6)
+struct audio_buffer_pool *producer_pool_4 = NULL;  // S/PDIF 3 (Out 7-8)
 #endif
-struct audio_format audio_format_48k = { .format = AUDIO_BUFFER_FORMAT_PCM_S16, .sample_freq = 48000, .channel_count = 2 };
+struct audio_format audio_format_48k = { .format = AUDIO_BUFFER_FORMAT_PCM_S32, .sample_freq = 48000, .channel_count = 2 };
 
 // Legacy aliases
 #define producer_pool producer_pool_1
@@ -210,7 +211,7 @@ static uint16_t db_to_vol[CENTER_VOLUME_INDEX + 1] = {
     0x0519, 0x05b8, 0x066a, 0x0733, 0x0814, 0x0910, 0x0a2b, 0x0b68,
     0x0ccd, 0x0e5d, 0x101d, 0x1215, 0x1449, 0x16c3, 0x198a, 0x1ca8,
     0x2027, 0x2413, 0x287a, 0x2d6b, 0x32f5, 0x392d, 0x4027, 0x47fb,
-    0x50c3, 0x5a9e, 0x65ad, 0x7215, 0x7fff
+    0x50c3, 0x5a9e, 0x65ad, 0x7215, 0x8000
 };
 
 #define ENCODE_DB(x) ((int16_t)((x)*256))
@@ -250,22 +251,24 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     }
     last_packet_time = packet_start;
 
-    // Get audio buffers for S/PDIF outputs
+    // Get audio buffers for all output pairs (I2S + S/PDIF)
 #if PICO_RP2350
-    struct audio_buffer* audio_buf[4] = {NULL, NULL, NULL, NULL};
+    struct audio_buffer* audio_buf[NUM_STEREO_PAIRS] = {NULL, NULL, NULL, NULL};
     if (producer_pool_1) audio_buf[0] = take_audio_buffer(producer_pool_1, false);
     if (producer_pool_2) audio_buf[1] = take_audio_buffer(producer_pool_2, false);
     if (producer_pool_3) audio_buf[2] = take_audio_buffer(producer_pool_3, false);
     if (producer_pool_4) audio_buf[3] = take_audio_buffer(producer_pool_4, false);
 #else
-    struct audio_buffer* audio_buf[2] = {NULL, NULL};
+    struct audio_buffer* audio_buf[NUM_STEREO_PAIRS] = {NULL, NULL};
     if (producer_pool_1) audio_buf[0] = take_audio_buffer(producer_pool_1, false);
     if (producer_pool_2) audio_buf[1] = take_audio_buffer(producer_pool_2, false);
 #endif
 
-    uint32_t sample_count = data_len / 4;  // 2 channels * 2 bytes per sample
+    const uint8_t bit_depth = usb_input_bit_depth;  // snapshot once — avoid double-read of volatile
+    uint32_t bytes_per_frame = (bit_depth == 24) ? 6 : 4;
+    uint32_t sample_count = data_len / bytes_per_frame;
 
-    for (int b = 0; b < NUM_SPDIF_INSTANCES; b++) {
+    for (int b = 0; b < NUM_STEREO_PAIRS; b++) {
         if (audio_buf[b]) {
             audio_buf[b]->sample_count = sample_count;
         } else if (matrix_mixer.outputs[b*2].enabled || matrix_mixer.outputs[b*2+1].enabled) {
@@ -287,11 +290,7 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
         for (int i = 0; i < 2; i++) {
             struct audio_buffer *sb = take_audio_buffer(producer_pool_1, false);
             if (sb) {
-                int16_t *out = (int16_t *)sb->buffer->bytes;
-                for (uint32_t j = 0; j < 192; j++) {
-                    out[j * 2] = 0;
-                    out[j * 2 + 1] = 0;
-                }
+                memset(sb->buffer->bytes, 0, 192 * 8);
                 sb->sample_count = 192;
                 give_audio_buffer(producer_pool_1, sb);
             }
@@ -304,8 +303,6 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
         sync_started = true;
     }
     total_samples_produced += sample_count;
-
-    const int16_t *in = (const int16_t *)data;
 
 #if PICO_RP2350
     // ------------------------------------------------------------------------
@@ -330,9 +327,22 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     static float buf_l[192], buf_r[192];
 
     // ========== PASS 1: Input conversion + Preamp + Loudness ==========
-    for (uint32_t i = 0; i < sample_count; i++) {
-        buf_l[i] = (float)in[i*2] * inv_32768 * preamp;
-        buf_r[i] = (float)in[i*2+1] * inv_32768 * preamp;
+    if (bit_depth == 24) {
+        const uint8_t *p = (const uint8_t *)data;
+        const float inv_8388608 = 1.0f / 8388608.0f;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            int32_t left  = (int32_t)((uint32_t)p[2] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[0] << 8) >> 8;
+            int32_t right = (int32_t)((uint32_t)p[5] << 24 | (uint32_t)p[4] << 16 | (uint32_t)p[3] << 8) >> 8;
+            buf_l[i] = (float)left * inv_8388608 * preamp;
+            buf_r[i] = (float)right * inv_8388608 * preamp;
+            p += 6;
+        }
+    } else {
+        const int16_t *in = (const int16_t *)data;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            buf_l[i] = (float)in[i*2] * inv_32768 * preamp;
+            buf_r[i] = (float)in[i*2+1] * inv_32768 * preamp;
+        }
     }
 
     // Loudness compensation
@@ -429,9 +439,9 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
         core1_eq_work.sample_count = sample_count;
         core1_eq_work.vol_mul = vol_mul;
         core1_eq_work.delay_write_idx = delay_write_idx;
-        core1_eq_work.spdif_out[0] = audio_buf[1] ? (int16_t *)audio_buf[1]->buffer->bytes : NULL;
-        core1_eq_work.spdif_out[1] = audio_buf[2] ? (int16_t *)audio_buf[2]->buffer->bytes : NULL;
-        core1_eq_work.spdif_out[2] = audio_buf[3] ? (int16_t *)audio_buf[3]->buffer->bytes : NULL;
+        core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
+        core1_eq_work.spdif_out[1] = audio_buf[2] ? (int32_t *)audio_buf[2]->buffer->bytes : NULL;
+        core1_eq_work.spdif_out[2] = audio_buf[3] ? (int32_t *)audio_buf[3]->buffer->bytes : NULL;
         core1_eq_work.work_done = false;
         __dmb();
         core1_eq_work.work_ready = true;
@@ -473,7 +483,7 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
             }
         }
 
-        // Core 0: Peaks + S/PDIF for pair 0
+        // Core 0: Peaks + I2S output for pair 0
         for (uint32_t i = 0; i < sample_count; i++) {
             float abs_ol = fabsf(buf_out[0][i]); if (abs_ol > peak_ol) peak_ol = abs_ol;
             float abs_or = fabsf(buf_out[1][i]); if (abs_or > peak_or) peak_or = abs_or;
@@ -481,19 +491,19 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
         if (audio_buf[0]) {
             int left_ch = 0, right_ch = 1;
             if (!matrix_mixer.outputs[left_ch].enabled && !matrix_mixer.outputs[right_ch].enabled) {
-                memset(audio_buf[0]->buffer->bytes, 0, sample_count * 4);
+                memset(audio_buf[0]->buffer->bytes, 0, sample_count * 8);
             } else {
-                int16_t *out_ptr = (int16_t *)audio_buf[0]->buffer->bytes;
+                int32_t *out_ptr = (int32_t *)audio_buf[0]->buffer->bytes;
                 for (uint32_t i = 0; i < sample_count; i++) {
                     float dl = fmaxf(-1.0f, fminf(1.0f, buf_out[0][i]));
                     float dr = fmaxf(-1.0f, fminf(1.0f, buf_out[1][i]));
-                    out_ptr[i*2]   = (int16_t)(dl * 32767.0f);
-                    out_ptr[i*2+1] = (int16_t)(dr * 32767.0f);
+                    out_ptr[i*2]   = (int32_t)(dl * 8388607.0f);
+                    out_ptr[i*2+1] = (int32_t)(dr * 8388607.0f);
                 }
             }
         }
 
-        // Wait for Core 1 (EQ + delay + S/PDIF for outputs 2-7)
+        // Wait for Core 1 (EQ + delay + output for outputs 2-7)
         while (!core1_eq_work.work_done) {
             __wfe();
         }
@@ -549,21 +559,21 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
             float abs_or = fabsf(buf_out[1][i]); if (abs_or > peak_or) peak_or = abs_or;
         }
 
-        // S/PDIF conversion
-        for (int pair = 0; pair < 4; pair++) {
+        // Output conversion (I2S + S/PDIF — all get PCM_S32, connections handle encoding)
+        for (int pair = 0; pair < NUM_STEREO_PAIRS; pair++) {
             if (!audio_buf[pair]) continue;
             int left_ch = pair * 2;
             int right_ch = pair * 2 + 1;
             if (!matrix_mixer.outputs[left_ch].enabled && !matrix_mixer.outputs[right_ch].enabled) {
-                memset(audio_buf[pair]->buffer->bytes, 0, sample_count * 4);
+                memset(audio_buf[pair]->buffer->bytes, 0, sample_count * 8);
                 continue;
             }
-            int16_t *out_ptr = (int16_t *)audio_buf[pair]->buffer->bytes;
+            int32_t *out_ptr = (int32_t *)audio_buf[pair]->buffer->bytes;
             for (uint32_t i = 0; i < sample_count; i++) {
                 float dl = fmaxf(-1.0f, fminf(1.0f, buf_out[left_ch][i]));
                 float dr = fmaxf(-1.0f, fminf(1.0f, buf_out[right_ch][i]));
-                out_ptr[i*2]     = (int16_t)(dl * 32767.0f);
-                out_ptr[i*2+1]   = (int16_t)(dr * 32767.0f);
+                out_ptr[i*2]     = (int32_t)(dl * 8388607.0f);
+                out_ptr[i*2+1]   = (int32_t)(dr * 8388607.0f);
             }
         }
 
@@ -607,11 +617,24 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     static int32_t buf_l[192], buf_r[192];
 
     // ========== PASS 1: Input conversion + Preamp + Loudness ==========
-    for (uint32_t i = 0; i < sample_count; i++) {
-        int32_t raw_left_32 = (int32_t)in[i*2] << 14;
-        int32_t raw_right_32 = (int32_t)in[i*2+1] << 14;
-        buf_l[i] = fast_mul_q28(raw_left_32, preamp);
-        buf_r[i] = fast_mul_q28(raw_right_32, preamp);
+    if (bit_depth == 24) {
+        const uint8_t *p = (const uint8_t *)data;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            // 24-bit -> Q28: left-justify to [31:8] then >>2 = net <<6
+            int32_t raw_left_32  = (int32_t)((uint32_t)p[2] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[0] << 8) >> 2;
+            int32_t raw_right_32 = (int32_t)((uint32_t)p[5] << 24 | (uint32_t)p[4] << 16 | (uint32_t)p[3] << 8) >> 2;
+            buf_l[i] = fast_mul_q28(raw_left_32, preamp);
+            buf_r[i] = fast_mul_q28(raw_right_32, preamp);
+            p += 6;
+        }
+    } else {
+        const int16_t *in = (const int16_t *)data;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            int32_t raw_left_32 = (int32_t)in[i*2] << 14;
+            int32_t raw_right_32 = (int32_t)in[i*2+1] << 14;
+            buf_l[i] = fast_mul_q28(raw_left_32, preamp);
+            buf_r[i] = fast_mul_q28(raw_right_32, preamp);
+        }
     }
 
     // Loudness compensation (per-sample — biquad state coupling)
@@ -703,7 +726,7 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
         core1_eq_work.sample_count = sample_count;
         core1_eq_work.vol_mul = vol_mul;
         core1_eq_work.delay_write_idx = delay_write_idx;
-        core1_eq_work.spdif_out[0] = audio_buf[1] ? (int16_t *)audio_buf[1]->buffer->bytes : NULL;
+        core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.work_done = false;
         __dmb();
         core1_eq_work.work_ready = true;
@@ -751,12 +774,12 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
         }
         if (audio_buf[0]) {
             if (!matrix_mixer.outputs[0].enabled && !matrix_mixer.outputs[1].enabled) {
-                memset(audio_buf[0]->buffer->bytes, 0, sample_count * 4);
+                memset(audio_buf[0]->buffer->bytes, 0, sample_count * 8);
             } else {
-                int16_t *out_ptr = (int16_t *)audio_buf[0]->buffer->bytes;
+                int32_t *out_ptr = (int32_t *)audio_buf[0]->buffer->bytes;
                 for (uint32_t i = 0; i < sample_count; i++) {
-                    out_ptr[i*2]   = (int16_t)(clip_s32(buf_out[0][i] + (1<<13)) >> 14);
-                    out_ptr[i*2+1] = (int16_t)(clip_s32(buf_out[1][i] + (1<<13)) >> 14);
+                    out_ptr[i*2]   = clip_s24((buf_out[0][i] + (1 << 5)) >> 6);
+                    out_ptr[i*2+1] = clip_s24((buf_out[1][i] + (1 << 5)) >> 6);
                 }
             }
         }
@@ -817,19 +840,19 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
             if (abs(buf_out[1][i]) > peak_or) peak_or = abs(buf_out[1][i]);
         }
 
-        // S/PDIF conversion (2 stereo pairs)
-        for (int pair = 0; pair < NUM_SPDIF_INSTANCES; pair++) {
+        // Output conversion (I2S + S/PDIF — all get PCM_S32, connections handle encoding)
+        for (int pair = 0; pair < NUM_STEREO_PAIRS; pair++) {
             if (!audio_buf[pair]) continue;
             int left_ch = pair * 2;
             int right_ch = pair * 2 + 1;
             if (!matrix_mixer.outputs[left_ch].enabled && !matrix_mixer.outputs[right_ch].enabled) {
-                memset(audio_buf[pair]->buffer->bytes, 0, sample_count * 4);
+                memset(audio_buf[pair]->buffer->bytes, 0, sample_count * 8);
                 continue;
             }
-            int16_t *out_ptr = (int16_t *)audio_buf[pair]->buffer->bytes;
+            int32_t *out_ptr = (int32_t *)audio_buf[pair]->buffer->bytes;
             for (uint32_t i = 0; i < sample_count; i++) {
-                out_ptr[i*2]   = (int16_t)(clip_s32(buf_out[left_ch][i] + (1<<13)) >> 14);
-                out_ptr[i*2+1] = (int16_t)(clip_s32(buf_out[right_ch][i] + (1<<13)) >> 14);
+                out_ptr[i*2]   = clip_s24((buf_out[left_ch][i] + (1 << 5)) >> 6);
+                out_ptr[i*2+1] = clip_s24((buf_out[right_ch][i] + (1 << 5)) >> 6);
             }
         }
 
@@ -854,9 +877,9 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     global_status.peaks[4] = (uint16_t)(peak_sub >> 13);
 #endif
 
-    // Return all buffers
+    // Return all buffers (I2S + S/PDIF)
 #if PICO_RP2350
-    for (int b = 0; b < 4; b++) {
+    for (int b = 0; b < NUM_STEREO_PAIRS; b++) {
         if (audio_buf[b]) {
             struct audio_buffer_pool *pool = (b == 0) ? producer_pool_1 :
                                               (b == 1) ? producer_pool_2 :
@@ -1106,7 +1129,12 @@ static bool _as_setup_request_handler(__unused struct usb_endpoint *ep, struct u
 static bool as_set_alternate(struct usb_interface *interface, uint alt) {
     assert(interface == &as_op_interface);
     usb_audio_alt_set = alt;
-    return alt < 2;
+    if (alt == 2) {
+        usb_input_bit_depth = 24;
+    } else {
+        usb_input_bit_depth = 16;
+    }
+    return alt < 3;
 }
 
 // ----------------------------------------------------------------------------
@@ -1241,9 +1269,6 @@ static void vendor_cmd_packet(struct usb_endpoint *ep) {
             if (buffer->data_len >= 1) {
                 crossfeed_config.enabled = (vendor_rx_buf[0] != 0);
                 crossfeed_update_pending = true;
-                // When disabling, set bypass immediately so next packet skips crossfeed
-                if (!crossfeed_config.enabled)
-                    crossfeed_bypassed = true;
             }
             break;
 
@@ -1392,15 +1417,16 @@ static void vendor_send_response(const void *data, uint len) {
     usb_start_single_buffer_control_in_transfer();
 }
 
-// Runtime pin configuration (output 0 = I2S fixed pins; 1.. = SPDIF/PDM)
+// Runtime pin configuration
+// Index 0 = I2S data pin, remaining = S/PDIF pins, last = PDM pin
 #if PICO_RP2350
 uint8_t output_pins[NUM_PIN_OUTPUTS] = {
-    PICO_AUDIO_I2S_DATA_PIN, PICO_SPDIF_PIN_2,
+    PICO_I2S_DATA_PIN, PICO_SPDIF_PIN_2,
     PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN
 };
 #else
 uint8_t output_pins[NUM_PIN_OUTPUTS] = {
-    PICO_AUDIO_I2S_DATA_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
+    PICO_I2S_DATA_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
 };
 #endif
 
@@ -1722,26 +1748,26 @@ static bool vendor_setup_request_handler(__unused struct usb_interface *interfac
 
                 if (out_idx >= NUM_PIN_OUTPUTS) {
                     status = PIN_CONFIG_INVALID_OUTPUT;
+                } else if (out_idx == 0) {
+                    // I2S output: runtime pin change not supported
+                    status = PIN_CONFIG_OUTPUT_ACTIVE;
                 } else if (!is_valid_gpio_pin(new_pin)) {
                     status = PIN_CONFIG_INVALID_PIN;
                 } else if (is_pin_in_use(new_pin, out_idx)) {
                     status = PIN_CONFIG_PIN_IN_USE;
                 } else if (new_pin == output_pins[out_idx]) {
-                    // No-op: pin unchanged
                     status = PIN_CONFIG_SUCCESS;
-                } else if (out_idx == 0) {
-                    // Output 0 is I2S (fixed pins 22/26/27), pin not changeable
-                    status = PIN_CONFIG_SUCCESS;
-                } else if (out_idx < NUM_SPDIF_INSTANCES) {
+                } else if (out_idx <= NUM_SPDIF_INSTANCES) {
                     // SPDIF output: disable → change pin → re-enable
-                    audio_spdif_instance_t *inst = spdif_instance_ptrs[out_idx];
+                    // spdif_instance_ptrs is 0-indexed for SPDIF instances (out_idx 1 → ptr[0])
+                    audio_spdif_instance_t *inst = spdif_instance_ptrs[out_idx - 1];
                     audio_spdif_set_enabled(inst, false);
                     audio_spdif_change_pin(inst, new_pin);
                     audio_spdif_set_enabled(inst, true);
                     output_pins[out_idx] = new_pin;
                     status = PIN_CONFIG_SUCCESS;
                 } else {
-                    // PDM output (out_idx == 4): must be disabled first
+                    // PDM output: must be disabled first
                     if (pdm_enabled || core1_mode == CORE1_MODE_PDM) {
                         status = PIN_CONFIG_OUTPUT_ACTIVE;
                     } else {
@@ -1844,18 +1870,15 @@ static const char *_get_descriptor_string(uint index) {
 // INIT
 // ----------------------------------------------------------------------------
 
-// First output (Out 1-2): I2S to PCM5102 — uses producer_pool_1
-#define I2S_DMA_CHANNEL  4   // SPDIF uses 0..3
-#define I2S_PIO_SM       1   // PIO1 SM1 (PDM uses PIO1 SM0)
-
-static const audio_i2s_config_t i2s_config = {
-    .data_pin = PICO_AUDIO_I2S_DATA_PIN,
-    .clock_pin_base = PICO_AUDIO_I2S_BCLK_PIN,
-    .dma_channel = I2S_DMA_CHANNEL,
-    .pio_sm = I2S_PIO_SM,
+// I2S Instance (Out 1-2)
+static audio_i2s_config_t i2s_config_1 = {
+    .data_pin = PICO_I2S_DATA_PIN,
+    .clock_pin_base = PICO_I2S_CLOCK_PIN_BASE,
+    .dma_channel = 0,
+    .pio_sm = 0,
 };
 
-// S/PDIF Instances (Out 3-4, 5-6, 7-8)
+// S/PDIF Instances (remaining stereo pairs)
 static audio_spdif_instance_t spdif_instance_2 = {0};  // Out 3-4
 #if PICO_RP2350
 static audio_spdif_instance_t spdif_instance_3 = {0};  // Out 5-6
@@ -1888,7 +1911,11 @@ struct audio_spdif_config spdif_config_4 = {
 };
 #endif
 
-struct audio_buffer_format producer_format = { .format = &audio_format_48k, .sample_stride = 4 };
+struct audio_buffer_format producer_format = { .format = &audio_format_48k, .sample_stride = 8 };
+
+// Legacy aliases
+#define spdif_sub_instance spdif_instance_2
+#define sub_config spdif_config_2
 
 // Initialize matrix mixer with default stereo pass-through
 static void matrix_init_defaults(void) {
@@ -1920,7 +1947,8 @@ void usb_sound_card_init(void) {
     // Initialize matrix mixer defaults
     matrix_init_defaults();
 
-    // Producer pools (must happen before USB init to claim DMA channels)
+    // Audio output setup (must happen before USB init to claim DMA channels)
+    // I2S and S/PDIF share PIO0 but use different SMs and DMA channels
     producer_pool_1 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
     producer_pool_2 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
 #if PICO_RP2350
@@ -1928,12 +1956,11 @@ void usb_sound_card_init(void) {
     producer_pool_4 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
 #endif
 
-    // Output 0 (Out 1-2): I2S to PCM5102
-    audio_i2s_setup(&audio_format_48k, &i2s_config);
-    audio_i2s_connect_extra(producer_pool_1, false, AUDIO_BUFFER_COUNT / 2, 192, NULL);
-    audio_i2s_set_enabled(true);
+    // Setup I2S output (Out 1-2) — 24-bit, 32-bit slots
+    audio_i2s_setup(&audio_format_48k, &i2s_config_1);
+    audio_i2s_connect_extra(producer_pool_1, true, AUDIO_BUFFER_COUNT / 2, 192, NULL);
 
-    // Outputs 1..: S/PDIF instances
+    // Setup S/PDIF instances (remaining pairs)
     audio_spdif_setup(&spdif_instance_2, &audio_format_48k, &spdif_config_2);
     audio_spdif_connect_extra(&spdif_instance_2, producer_pool_2, false, AUDIO_BUFFER_COUNT / 2, NULL);
 
@@ -1945,17 +1972,19 @@ void usb_sound_card_init(void) {
     audio_spdif_connect_extra(&spdif_instance_4, producer_pool_4, false, AUDIO_BUFFER_COUNT / 2, NULL);
 #endif
 
-    // Instance pointer array for pin config (output 0 = I2S, no SPDIF instance)
-    spdif_instance_ptrs[0] = NULL;
-    spdif_instance_ptrs[1] = &spdif_instance_2;
+    // Populate S/PDIF instance pointer array for pin config commands
+    spdif_instance_ptrs[0] = &spdif_instance_2;
 #if PICO_RP2350
-    spdif_instance_ptrs[2] = &spdif_instance_3;
-    spdif_instance_ptrs[3] = &spdif_instance_4;
+    spdif_instance_ptrs[1] = &spdif_instance_3;
+    spdif_instance_ptrs[2] = &spdif_instance_4;
 #endif
 
     irq_set_priority(DMA_IRQ_0 + PICO_AUDIO_SPDIF_DMA_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
 
-    // Start S/PDIF outputs synchronized (output 0 is I2S, not in sync group)
+    // Enable I2S output
+    audio_i2s_set_enabled(true);
+
+    // Start S/PDIF outputs synchronized
 #if PICO_RP2350
     audio_spdif_instance_t *spdif_all[] = {
         &spdif_instance_2, &spdif_instance_3, &spdif_instance_4
@@ -1985,6 +2014,13 @@ void usb_sound_card_init(void) {
     usb_set_default_transfer(&ep_op_out, &as_transfer);
     as_sync_transfer.type = &as_sync_transfer_type;
     usb_set_default_transfer(&ep_op_sync, &as_sync_transfer);
+
+    // Feedback EP only sends 3 bytes — shrink its DPRAM allocation to the
+    // hardware-minimum 128 bytes so the audio OUT EP can use stride 1024.
+    ep_op_sync.buffer_stride = 128;
+    // Audio OUT must accept the largest packet across all alt settings
+    // (24-bit 96kHz = 576 bytes), not just alt=1's wMaxPacketSize.
+    ep_op_out.buffer_size = 576;
 
     // Vendor interface (control-only, no endpoints)
     usb_interface_init(&vendor_interface, &audio_device_config.vendor_interface, NULL, 0, true);

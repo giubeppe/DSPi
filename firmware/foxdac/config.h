@@ -32,18 +32,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 
 #define ENABLE_SUB 1
 
-// First output (Out 1-2): I2S to PCM5102
-#define PICO_AUDIO_I2S_DATA_PIN    22   // DIN on PCM5102
-#define PICO_AUDIO_I2S_BCLK_PIN    26   // BCLK
-#define PICO_AUDIO_I2S_LRCLK_PIN   27   // WS / LRCLK (clock_pin_base + 1)
+// I2S Output Pins (Out 1-2 — first stereo pair)
+#define PICO_I2S_DATA_PIN       22   // I2S DIN
+#define PICO_I2S_CLOCK_PIN_BASE 26   // I2S BCLK=26, LRCLK=27
 
-// S/PDIF Output Pins (Out 3-4, 5-6, 7-8)
-#undef PICO_AUDIO_SPDIF_PIN
-#define PICO_AUDIO_SPDIF_PIN   6    // legacy; first output is now I2S
-#define PICO_SPDIF_PIN_2       7    // S/PDIF 2 (Out 3-4)
+// S/PDIF Output Pins (remaining stereo pairs)
+#define PICO_SPDIF_PIN_2       7    // S/PDIF 1 (Out 3-4)
 #if PICO_RP2350
-#define PICO_SPDIF_PIN_3       8    // S/PDIF 3 (Out 5-6) — RP2350 only
-#define PICO_SPDIF_PIN_4       9    // S/PDIF 4 (Out 7-8) — RP2350 only
+#define PICO_SPDIF_PIN_3       8    // S/PDIF 2 (Out 5-6) — RP2350 only
+#define PICO_SPDIF_PIN_4       9    // S/PDIF 3 (Out 7-8) — RP2350 only
 #endif
 
 // PDM Subwoofer Output Pin (PIO1)
@@ -184,13 +181,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define PIN_CONFIG_INVALID_OUTPUT   0x03
 #define PIN_CONFIG_OUTPUT_ACTIVE    0x04
 
-// Number of configurable outputs (SPDIF + PDM)
+// Number of configurable outputs (I2S + SPDIF + PDM)
 #if PICO_RP2350
-#define NUM_SPDIF_INSTANCES         4
-#define NUM_PIN_OUTPUTS             5   // 4 SPDIF + 1 PDM
+#define NUM_SPDIF_INSTANCES         3   // S/PDIF pairs (Out 3-8); Out 1-2 is I2S
+#define NUM_STEREO_PAIRS            4   // 1 I2S + 3 SPDIF
+#define NUM_PIN_OUTPUTS             5   // 1 I2S + 3 SPDIF + 1 PDM
 #else
-#define NUM_SPDIF_INSTANCES         2
-#define NUM_PIN_OUTPUTS             3   // 2 SPDIF + 1 PDM
+#define NUM_SPDIF_INSTANCES         1   // S/PDIF pair (Out 3-4); Out 1-2 is I2S
+#define NUM_STEREO_PAIRS            2   // 1 I2S + 1 SPDIF
+#define NUM_PIN_OUTPUTS             3   // 1 I2S + 1 SPDIF + 1 PDM
 #endif
 
 // USB Audio Feature Unit IDs
@@ -259,13 +258,13 @@ typedef struct {
     uint32_t          sample_count;
     float             vol_mul;
     uint32_t          delay_write_idx;  // Snapshot for Core 1 delay processing
-    int16_t          *spdif_out[3];     // Pairs 1-3 output buffers (NULL = skip)
+    int32_t          *spdif_out[3];     // Pairs 1-3 output buffers (NULL = skip)
 #else
     int32_t         (*buf_out)[192];   // Pointer to buf_out array (Q28), set once at init
     uint32_t          sample_count;
     int32_t           vol_mul;         // Q15 master volume
     uint32_t          delay_write_idx;
-    int16_t          *spdif_out[1];    // SPDIF pair 2 output buffer (NULL = skip)
+    int32_t          *spdif_out[1];    // SPDIF pair 2 output buffer (NULL = skip)
 #endif
 } Core1EqWork;
 
@@ -397,6 +396,12 @@ static inline int32_t clip_s64_to_s32(int64_t x) {
     if (x > INT32_MAX) return INT32_MAX;
     if (x < INT32_MIN) return INT32_MIN;
     return (int32_t)x;
+}
+
+static inline int32_t clip_s24(int32_t x) {
+    if (x > 0x7FFFFF) return 0x7FFFFF;
+    if (x < -0x800000) return -0x800000;
+    return x;
 }
 
 // Q15 fixed-point multiply using 16-bit partial products.

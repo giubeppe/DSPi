@@ -22,6 +22,7 @@
 #include "usb_audio.h"
 #include "loudness.h"
 #include "crossfeed.h"
+#include "pico/audio_i2s.h"
 #include "pico/audio_spdif.h"
 
 // ----------------------------------------------------------------------------
@@ -33,53 +34,18 @@ volatile uint32_t feedback_10_14 = 0;
 volatile uint32_t nominal_feedback_10_14 = 0;
 
 // SOF handler state for feedback measurement
-static uint32_t sof_count = 0;
-static uint32_t fb_last_total = 0;
-static uint32_t fb_accum = 0;
 static volatile uint32_t feedback_reset_value = 0;
 
-// USB SOF IRQ — measures device clock vs host clock for async feedback
+// USB SOF IRQ — provides async feedback to the host.
+// Uses nominal (pre-computed) feedback from the sample rate, matching the
+// original working implementation. The PIO clock is derived from the same
+// PLL so the nominal value is accurate enough for USB rate adaptation.
 void __not_in_flash_func(usb_sof_irq)(void) {
-    extern audio_spdif_instance_t *spdif_instance_ptrs[];
-    audio_spdif_instance_t *inst = spdif_instance_ptrs[0];
-
-    // Output 0 is I2S (no SPDIF instance): use nominal feedback
-    if (!inst) {
-        feedback_10_14 = nominal_feedback_10_14;
-        return;
-    }
-
-    // Read total DMA words consumed by instance 0 (sub-buffer precision)
-    uint32_t remaining = dma_channel_hw_addr(inst->dma_channel)->transfer_count;
-    uint32_t current_total = inst->words_consumed
-                           + (inst->current_transfer_words - remaining);
-
-    // Handle reset request from rate change
     if (feedback_reset_value) {
-        fb_accum = feedback_reset_value;
+        feedback_10_14 = feedback_reset_value;
         feedback_reset_value = 0;
-        fb_last_total = current_total;
-        sof_count = 0;
-    }
-
-    sof_count++;
-    if ((sof_count & 0x3) == 0) {  // Every 4 SOFs (bRefresh=2 → 2^2=4)
-        uint32_t delta_words = current_total - fb_last_total;
-        fb_last_total = current_total;
-
-        if (delta_words > 0) {
-            // 10.14 format: delta_words / 4_SOFs / 4_words_per_sample * 2^14
-            //             = delta_words * (2^14 / 16) = delta_words << 10
-            uint32_t raw = delta_words << 10;
-
-            if (fb_accum == 0) {
-                fb_accum = raw;
-            } else {
-                int32_t error = (int32_t)raw - (int32_t)fb_accum;
-                fb_accum += error >> 3;  // IIR α≈0.125, τ≈32ms
-            }
-            feedback_10_14 = fb_accum;
-        }
+    } else if (feedback_10_14 == 0) {
+        feedback_10_14 = nominal_feedback_10_14;
     }
 }
 
@@ -96,7 +62,7 @@ volatile uint32_t spdif_underruns = 0;     // USB packet gap > 2ms (consumer lik
 volatile uint32_t usb_audio_packets = 0;   // Debug: count of USB audio packets received
 volatile uint32_t usb_audio_alt_set = 0;   // Debug: last alt setting selected
 volatile uint32_t usb_audio_mounted = 0;   // Debug: audio mounted state
-static volatile uint8_t clock_176mhz = 0;
+// Clock is fixed at 307.2MHz (no dynamic switching)
 
 #include "pico/audio.h"
 extern struct audio_format audio_format_48k;
@@ -105,37 +71,13 @@ extern MatrixMixer matrix_mixer;
 static void perform_rate_change(uint32_t new_freq) {
     switch (new_freq) { case 44100: case 48000: case 96000: break; default: new_freq = 44100; }
 
-    // Update the audio format so pico_audio_spdif can update the PIO divider
+    // Update the audio format so I2S and S/PDIF can update their PIO dividers
     audio_format_48k.sample_freq = new_freq;
 
-#if PICO_RP2350
-    // RP2350: Dynamic clock switching for integer PIO dividers (I2S/SPDIF, no deterministic jitter)
-    // 48kHz/96kHz -> 307.2MHz (48000*6400) for integer I2S PIO divider
-    // 44.1kHz -> 264.6MHz (44100*6000)
-    uint32_t target_freq = (new_freq == 44100) ? 264600000 : 307200000;
-    
-    // Only change if needed to avoid glitches
-    if (clock_get_hz(clk_sys) != target_freq) {
-        // User requested 1.1V even for high clock
-        vreg_set_voltage(VREG_VOLTAGE_1_10); 
-        busy_wait_us(100);
-        set_sys_clock_hz(target_freq, false);
-    }
-#else
-    // RP2040: System clock for integer PIO dividers (I2S) and SPDIF
-    // 48kHz/96kHz -> 307.2MHz (integer divider 25600 for I2S at 48k)
-    // 44.1kHz -> 264.6MHz
-    if((new_freq == 48000 || new_freq == 96000) && clock_176mhz) {
-        // 307.2MHz -> VCO 1228.8 MHz
-        set_sys_clock_pll(1228800000, 4, 1);
-        clock_176mhz = 0;
-    }
-    else if(new_freq == 44100 && !clock_176mhz) {
-        // 264.6MHz (44100 * 6000) -> VCO 1058.4 MHz
-        set_sys_clock_pll(1058400000, 4, 1);
-        clock_176mhz = 1;
-    }
-#endif
+    // 307.2MHz fixed clock — no switching needed.
+    // 48kHz/96kHz get perfect integer PIO dividers;
+    // 44.1kHz uses PIO fractional divider (acceptable jitter).
+
     // Reset sync
     extern volatile bool sync_started;
     extern volatile uint64_t total_samples_produced;
@@ -149,7 +91,7 @@ static void perform_rate_change(uint32_t new_freq) {
 
     dsp_recalculate_all_filters((float)new_freq);
     loudness_recompute_pending = true;
-    crossfeed_update_pending = true;  // Recalculate crossfeed coefficients for new sample rate
+    crossfeed_update_pending = true;
     pdm_update_clock(new_freq);
 }
 
@@ -158,19 +100,18 @@ void core0_init() {
     gpio_init(25); gpio_set_dir(25, GPIO_OUT);
 
 #if PICO_RP2350
-    // RP2350: Use set_sys_clock_hz for proper clock tracking
+    // RP2350: 307.2MHz — integer PIO dividers for 48kHz/96kHz
     vreg_set_voltage(VREG_VOLTAGE_1_10);
     busy_wait_ms(10);
 
-    // 307.2MHz for 48kHz I2S (integer PIO divider, no deterministic jitter)
     if (!set_sys_clock_hz(307200000, false)) {
         set_sys_clock_hz(150000000, false);
     }
 #else
+    // RP2040: 307.2MHz — VCO 1536MHz / 5 / 1
     vreg_set_voltage(VREG_VOLTAGE_1_20);
     busy_wait_ms(10);
-    // Initial 307.2MHz (48k family: integer I2S PIO divider)
-    set_sys_clock_pll(1228800000, 4, 1);
+    set_sys_clock_pll(1536000000, 5, 1);
 #endif
 
     gpio_init(23); gpio_set_dir(23, GPIO_OUT); gpio_put(23, 1);
@@ -180,9 +121,9 @@ void core0_init() {
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
 
     // [CRITICAL FIX]
-    // Initialize USB/SPDIF *BEFORE* PDM.
-    // SPDIF requires DMA Channel 0 (hardcoded in config).
-    // If PDM inits first, it steals Ch 0 via dma_claim_unused_channel(), causing SPDIF to panic/crash.
+    // Initialize USB/I2S/SPDIF *BEFORE* PDM.
+    // I2S requires DMA Channel 0 (hardcoded in config).
+    // If PDM inits first, it steals Ch 0 via dma_claim_unused_channel(), causing I2S to panic/crash.
     usb_sound_card_init();
 
     // Initialize nominal feedback for default sample rate
@@ -197,14 +138,15 @@ void core0_init() {
         dsp_update_delay_samples(48000.0f);
         restore_interrupts(flags);
 
-        // Apply saved output pin configuration (output 0 = I2S fixed, skip)
+        // Apply saved S/PDIF pin configuration (before Core 1 starts)
+        // Index 0 in output_pins is I2S (fixed), SPDIF starts at index 1
         extern uint8_t output_pins[];
         extern audio_spdif_instance_t *spdif_instance_ptrs[];
         for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
-            if (i == 0 || !spdif_instance_ptrs[i]) continue;
-            if (output_pins[i] != spdif_instance_ptrs[i]->pin) {
+            uint8_t pin_idx = i + 1;  // offset: output_pins[1] → spdif_instance_ptrs[0]
+            if (output_pins[pin_idx] != spdif_instance_ptrs[i]->pin) {
                 audio_spdif_set_enabled(spdif_instance_ptrs[i], false);
-                audio_spdif_change_pin(spdif_instance_ptrs[i], output_pins[i]);
+                audio_spdif_change_pin(spdif_instance_ptrs[i], output_pins[pin_idx]);
                 audio_spdif_set_enabled(spdif_instance_ptrs[i], true);
             }
         }
@@ -246,19 +188,14 @@ int main(void) {
     gpio_put(25, 1);
 
 #if !PICO_RP2350
-    set_sys_clock_pll(1536000000, 4, 2);
+    // Temporary safe clock before core0_init sets 307.2MHz
+    set_sys_clock_pll(1536000000, 6, 2);
 #endif
 
     core0_init();
 
     // Enable watchdog
     watchdog_enable(8000, 1);
-
-    // Sync crossfeed state and bypass flag once after init/flash load so they match config
-    // before any audio is processed (avoids crossfeed "not working" if main loop was delayed)
-    crossfeed_update_pending = false;
-    crossfeed_compute_coefficients(&crossfeed_state, (const CrossfeedConfig *)&crossfeed_config, (float)audio_state.freq);
-    crossfeed_bypassed = !crossfeed_config.enabled;
 
     while (1) {
         // Update watchdog

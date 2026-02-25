@@ -403,8 +403,9 @@ void _usb_give_buffer(struct usb_endpoint *ep, uint32_t len) {
 
 #if !PICO_USBDEV_BULK_ONLY_EP1_THRU_16
     if (ep->current_give_buffer) {
-        val |= PICO_USBDEV_ISOCHRONOUS_BUFFER_STRIDE_TYPE
-                << 11u; // 11 + 16 = 27 - which is where stride bits go (and only relevant on buffer 1)
+        uint stride_type = __builtin_ctz(ep->buffer_stride) - 7;
+        if (stride_type > 3) stride_type = 3;
+        val |= stride_type << 11u; // bits [28:27] of full register = double-buffer ISO offset
     }
 #endif
 

@@ -8,5 +8,5 @@ if (NOT TARGET pico_audio_i2s)
     )
 
     target_include_directories(pico_audio_i2s INTERFACE ${CMAKE_CURRENT_LIST_DIR}/include)
-    target_link_libraries(pico_audio_i2s INTERFACE hardware_dma hardware_pio hardware_irq pico_audio)
+    target_link_libraries(pico_audio_i2s INTERFACE hardware_dma hardware_pio hardware_irq hardware_clocks pico_audio)
 endif()

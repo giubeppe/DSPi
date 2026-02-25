@@ -4,43 +4,38 @@
 ; SPDX-License-Identifier: BSD-3-Clause
 ;
 
-; Transmit a mono or stereo I2S audio stream as stereo
-; This is 16 bits per sample; can be altered by modifying the "set" params,
-; or made programmable by replacing "set x" with "mov x, y" and using Y as a config register.
+; Transmit a standard Philips I2S audio stream with 32-bit slots (24-bit data).
 ;
-; Autopull must be enabled, with threshold set to 32.
-; Since I2S is MSB-first, shift direction should be to left.
-; Hence the format of the FIFO word is:
+; Standard I2S timing: WS transitions 1 BCLK before the MSB of the new word.
+; This means the MSB is valid on the 2nd rising BCLK after WS changes.
 ;
-; | 31   :   16 | 15   :    0 |
-; | sample ws=0 | sample ws=1 |
+; Autopull enabled, threshold 32, left-shift (MSB-first).
+; Two 32-bit words per frame: left then right.
+; 24-bit audio is left-justified in each 32-bit word (bits [31:8]).
 ;
-; Data is output at 1 bit per clock. Use clock divider to adjust frequency.
-; Fractional divider will probably be needed to get correct bit clock period,
-; but for common syslck freqs this should still give a constant word select period.
+; One output pin for data. Two side-set pins: bit 0 = BCLK, bit 1 = LRCLK (WS).
+; WS LOW = left channel, WS HIGH = right channel (Philips convention).
 ;
-; One output pin is used for the data output.
-; Two side-set pins are used. Bit 0 is clock, bit 1 is word select.
-
-; Send 16 bit words to the PIO for mono, 32 bit words for stereo
+; Cycle budget: 2 cycles/bit × 32 bits × 2 channels = 128 PIO cycles/frame.
 
 .program audio_i2s
 .side_set 2
 
-                    ;        /--- LRCLK
-                    ;        |/-- BCLK
-bitloop1:           ;        ||
-    out pins, 1       side 0b10
-    jmp x-- bitloop1  side 0b11
-    out pins, 1       side 0b00
-    set x, 14         side 0b01
+                        ;        /--- LRCLK (WS)
+                        ;        |/-- BCLK
+                        ;        ||
+bitloop_left:
+    out pins, 1           side 0b00   ; WS=0(left), BCLK=0 — data transitions
+    jmp x-- bitloop_left  side 0b01   ; WS=0(left), BCLK=1 — receiver samples
+    out pins, 1           side 0b10   ; WS→1(right), BCLK=0 — WS transition (1 bit before MSB)
+    set x, 30             side 0b11   ; WS=1(right), BCLK=1
 
-bitloop0:
-    out pins, 1       side 0b00
-    jmp x-- bitloop0  side 0b01
-    out pins, 1       side 0b10
+bitloop_right:
+    out pins, 1           side 0b10   ; WS=1(right), BCLK=0 — data transitions
+    jmp x-- bitloop_right side 0b11   ; WS=1(right), BCLK=1 — receiver samples
+    out pins, 1           side 0b00   ; WS→0(left), BCLK=0 — WS transition (1 bit before MSB)
 public entry_point:
-    set x, 14         side 0b11
+    set x, 30             side 0b01   ; WS=0(left), BCLK=1
 
 % c-sdk {
 
@@ -50,6 +45,7 @@ static inline void audio_i2s_program_init(PIO pio, uint sm, uint offset, uint da
     sm_config_set_out_pins(&sm_config, data_pin, 1);
     sm_config_set_sideset_pins(&sm_config, clock_pin_base);
     sm_config_set_out_shift(&sm_config, false, true, 32);
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
 
     pio_sm_init(pio, sm, offset, &sm_config);
 

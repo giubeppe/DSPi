@@ -114,6 +114,15 @@ void core0_init() {
     set_sys_clock_pll(1536000000, 5, 1);
 #endif
 
+    // I2S MCLK output on a dedicated GPIO.
+    // With clk_sys fixed at 307.2MHz, divide by 25 to get 12.288MHz (256×48kHz).
+    // On 96kHz this is 128×fs, which most DACs accept as a valid MCLK ratio.
+    clock_gpio_init_int_frac8(
+        PICO_I2S_MCLK_PIN,
+        CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS,
+        25,
+        0);
+
     gpio_init(23); gpio_set_dir(23, GPIO_OUT); gpio_put(23, 1);
 
     pico_get_unique_board_id_string(usb_descriptor_str_serial, 17);

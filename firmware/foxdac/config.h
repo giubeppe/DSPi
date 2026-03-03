@@ -33,8 +33,9 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define ENABLE_SUB 1
 
 // I2S Output Pins (Out 1-2 — first stereo pair)
-#define PICO_I2S_DATA_PIN       22   // I2S DIN
-#define PICO_I2S_CLOCK_PIN_BASE 26   // I2S BCLK=26, LRCLK=27
+#define PICO_I2S_DATA_PIN        22   // I2S DIN
+#define PICO_I2S_CLOCK_PIN_BASE  26   // I2S BCLK=26, LRCLK=27
+#define PICO_I2S_MCLK_PIN        24   // I2S MCLK (clk_sys / 25 = 12.288MHz @ 307.2MHz)
 
 // S/PDIF Output Pins (remaining stereo pairs)
 #define PICO_SPDIF_PIN_2       7    // S/PDIF 1 (Out 3-4)
